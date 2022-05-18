@@ -64,8 +64,20 @@
 
 #define HSM_ECC_KEYID 0x11223344
 
+#include <lib/asn1/ASN1.h>
+#include <lib/asn1/ASN1Macros.h>
+#include <lib/core/CHIPTLV.h>
+
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 using namespace chip;
 using namespace chip::Crypto;
+using namespace chip::ASN1;
+using namespace chip::TLV;
 
 namespace {
 
@@ -1286,6 +1298,210 @@ static void TestP256_Keygen(nlTestSuite * inSuite, void * inContext)
     NL_TEST_ASSERT(inSuite, keypair.Pubkey().ECDSA_validate_msg_signature(test_msg, msglen, test_sig) == CHIP_NO_ERROR);
 }
 
+static CHIP_ERROR GenTBSCSR(ASN1Writer & writer, const Crypto::P256PublicKey & pubkey)
+{
+    CHIP_ERROR err = CHIP_NO_ERROR;
+    ASN1_START_SEQUENCE
+    {
+        ASN1_ENCODE_INTEGER(0);
+        ASN1_START_SEQUENCE
+        {
+            ASN1_START_SET
+            {
+                ASN1_START_SEQUENCE
+                {
+                    ASN1_ENCODE_OBJECT_ID(kOID_AttributeType_OrganizationName);
+                    ASN1_ENCODE_STRING(kASN1UniversalTag_UTF8String, "CSA", strlen("CSA"));
+                }
+                ASN1_END_SEQUENCE;
+            }
+            ASN1_END_SET;
+        }
+        ASN1_END_SEQUENCE;
+
+        ASN1_START_SEQUENCE
+        {
+            ASN1_START_SEQUENCE
+            {
+                ASN1_ENCODE_OBJECT_ID(kOID_PubKeyAlgo_ECPublicKey);
+                ASN1_ENCODE_OBJECT_ID(kOID_EllipticCurve_prime256v1);
+            }
+            ASN1_END_SEQUENCE;
+            ReturnErrorOnFailure(writer.PutBitString(0, pubkey, static_cast<uint8_t>(pubkey.Length())));
+        }
+        ASN1_END_SEQUENCE;
+        ASN1_START_CONSTRUCTED(kASN1TagClass_ContextSpecific, 0)
+        {
+            ASN1_START_SEQUENCE {
+                ASN1_ENCODE_OBJECT_ID(kOID_Extension_CSRRequest);
+                ASN1_START_SET
+                {
+                    ASN1_START_SEQUENCE {}
+                    ASN1_END_SEQUENCE;
+
+                }
+                ASN1_END_SET;
+            }
+            ASN1_END_SEQUENCE;
+        }
+        ASN1_END_CONSTRUCTED;
+    }
+    ASN1_END_SEQUENCE;
+    exit:
+        return err;
+}
+
+static CHIP_ERROR EncodeCSR(ASN1Writer & writer, const Crypto::P256PublicKey & pubkey, chip::Crypto::P256ECDSASignature & signature)
+{
+    CHIP_ERROR err = CHIP_NO_ERROR;
+    ASN1_START_SEQUENCE
+    {
+        ASN1_START_SEQUENCE
+        {
+            ASN1_ENCODE_INTEGER(0);
+            ASN1_START_SEQUENCE
+            {
+                ASN1_START_SET
+                {
+                    ASN1_START_SEQUENCE
+                    {
+                        ASN1_ENCODE_OBJECT_ID(kOID_AttributeType_OrganizationName);
+                        ASN1_ENCODE_STRING(kASN1UniversalTag_UTF8String, "CSA", strlen("CSA"));
+                    }
+                    ASN1_END_SEQUENCE;
+                }
+                ASN1_END_SET;
+            }
+            ASN1_END_SEQUENCE;
+
+            ASN1_START_SEQUENCE
+            {
+                ASN1_START_SEQUENCE
+                {
+                    ASN1_ENCODE_OBJECT_ID(kOID_PubKeyAlgo_ECPublicKey);
+                    ASN1_ENCODE_OBJECT_ID(kOID_EllipticCurve_prime256v1);
+                }
+                ASN1_END_SEQUENCE;
+                ReturnErrorOnFailure(writer.PutBitString(0, pubkey, static_cast<uint8_t>(pubkey.Length())));
+            }
+            ASN1_END_SEQUENCE;
+            ASN1_START_CONSTRUCTED(kASN1TagClass_ContextSpecific, 0)
+            {
+                ASN1_START_SEQUENCE {
+                    ASN1_ENCODE_OBJECT_ID(kOID_Extension_CSRRequest);
+                    ASN1_START_SET
+                    {
+                        ASN1_START_SEQUENCE {}
+                        ASN1_END_SEQUENCE;
+
+                    }
+                    ASN1_END_SET;
+                }
+                ASN1_END_SEQUENCE;
+            }
+            ASN1_END_CONSTRUCTED;
+        }
+        ASN1_END_SEQUENCE;
+
+        ASN1_START_SEQUENCE
+        {
+            ASN1_ENCODE_OBJECT_ID(kOID_SigAlgo_ECDSAWithSHA256);
+        }
+        ASN1_END_SEQUENCE;
+
+        ASN1_START_BIT_STRING_ENCAPSULATED
+        {
+            ASN1_START_SEQUENCE
+            {
+                ASN1_ENCODE_INTEGER(0);
+                ASN1_ENCODE_INTEGER(2);
+            }
+            ASN1_END_SEQUENCE;
+        }
+        ASN1_END_ENCAPSULATED;
+
+        // TODO: something is wrong here!
+        /*
+        uint8_t asn1SignatureBuf[kMax_ECDSA_Signature_Length_Der];
+        MutableByteSpan asn1Signature(asn1SignatureBuf);
+        ReturnErrorOnFailure(EcdsaRawSignatureToAsn1(kP256_FE_Length, ByteSpan(signature, signature.Length()), asn1Signature));
+
+        // signature OCTET STRING
+        ReturnErrorOnFailure(writer.PutOctetString(asn1Signature.data(), static_cast<uint16_t>(asn1Signature.size())));
+        */
+    }
+    ASN1_END_SEQUENCE;
+
+    exit:
+        return err;
+}
+
+void TestCSR_Gen_Raw(nlTestSuite * inSuite, void * inContext)
+{
+    HeapChecker heapChecker(inSuite);
+    uint8_t csr[kMAX_CSR_Length];
+    size_t length = sizeof(csr);
+
+    Test_P256Keypair keypair;
+
+    static uint8_t buf_tbs[2048], buf_csr[2048];
+    ASN1Writer writer_tbs, writer_csr;
+    uint16_t encodedLen;
+    CHIP_ERROR err;
+    chip::Crypto::P256ECDSASignature signature;
+
+    NL_TEST_ASSERT(inSuite, keypair.Initialize() == CHIP_NO_ERROR);
+
+    //NL_TEST_ASSERT(inSuite, keypair.NewCertificateSigningRequest(csr, length) == CHIP_NO_ERROR);
+
+    writer_tbs.Init(buf_tbs);
+    err = GenTBSCSR(writer_tbs, keypair.Pubkey());
+    NL_TEST_ASSERT(inSuite, err == CHIP_NO_ERROR);
+
+
+
+    encodedLen = (uint16_t)writer_tbs.GetLengthWritten();
+    keypair.ECDSA_sign_msg(buf_tbs, encodedLen, signature);
+
+    writer_csr.Init(buf_csr);
+    err = EncodeCSR(writer_csr, keypair.Pubkey(), signature);
+
+    encodedLen = (uint16_t)writer_csr.GetLengthWritten();
+
+    int fp;
+    unlink("/tmp/test.der");
+    fp = open("/tmp/test.der", O_CREAT | O_WRONLY, 777);
+
+    for (uint16_t i = 0; i < encodedLen; i++)
+    {
+        write(fp, &buf_csr[i], 1);
+    }
+
+    close(fp);
+    
+    NL_TEST_ASSERT(inSuite, length > 0);
+
+    P256PublicKey pubkey;
+    err = VerifyCertificateSigningRequest(csr, length, pubkey);
+    if (err != CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE)
+    {
+        NL_TEST_ASSERT(inSuite, err == CHIP_NO_ERROR);
+        NL_TEST_ASSERT(inSuite, pubkey.Length() == kP256_PublicKey_Length);
+        NL_TEST_ASSERT(inSuite, memcmp(pubkey.ConstBytes(), keypair.Pubkey().ConstBytes(), pubkey.Length()) == 0);
+
+        // Let's corrupt the CSR buffer and make sure it fails to verify
+        csr[length - 2] = (uint8_t)(csr[length - 2] + 1);
+        csr[length - 1] = (uint8_t)(csr[length - 1] + 1);
+
+        NL_TEST_ASSERT(inSuite, VerifyCertificateSigningRequest(csr, length, pubkey) != CHIP_NO_ERROR);
+    }
+    else
+    {
+        ChipLogError(Crypto, "The current platform does not support CSR parsing.");
+    }
+
+}
+
 static void TestCSR_Gen(nlTestSuite * inSuite, void * inContext)
 {
     HeapChecker heapChecker(inSuite);
@@ -2364,6 +2580,7 @@ static const nlTest sTests[] = {
     NL_TEST_DEF("Test PBKDF2 SHA256", TestPBKDF2_SHA256_TestVectors),
     NL_TEST_DEF("Test P256 Keygen", TestP256_Keygen),
     NL_TEST_DEF("Test CSR Generation", TestCSR_Gen),
+    NL_TEST_DEF("Test Raw CSR Generation", TestCSR_Gen_Raw),
     NL_TEST_DEF("Test Keypair Serialize", TestKeypair_Serialize),
     NL_TEST_DEF("Test Spake2p_spake2p FEMul", TestSPAKE2P_spake2p_FEMul),
     NL_TEST_DEF("Test Spake2p_spake2p FELoad/FEWrite", TestSPAKE2P_spake2p_FELoadWrite),
