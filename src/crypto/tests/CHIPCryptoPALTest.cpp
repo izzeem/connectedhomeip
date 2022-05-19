@@ -1298,19 +1298,35 @@ static void TestP256_Keygen(nlTestSuite * inSuite, void * inContext)
     NL_TEST_ASSERT(inSuite, keypair.Pubkey().ECDSA_validate_msg_signature(test_msg, msglen, test_sig) == CHIP_NO_ERROR);
 }
 
-static CHIP_ERROR GenTBSCSR(ASN1Writer & writer, const Crypto::P256PublicKey & pubkey)
+// Generates the to-be-signed portion of a PKCS#10 CSR (`CertificationRequestInformation`)
+// that contains the
+static CHIP_ERROR GenerateCertificationRequestInformation(ASN1Writer & writer, const Crypto::P256PublicKey & pubkey)
 {
     CHIP_ERROR err = CHIP_NO_ERROR;
+    /**
+     *
+     *  CertificationRequestInfo ::=
+     *     SEQUENCE {
+     *        version       INTEGER { v1(0) } (v1,...),
+     *        subject       Name,
+     *        subjectPKInfo SubjectPublicKeyInfo{{ PKInfoAlgorithms }},
+     *        attributes    [0] Attributes{{ CRIAttributes }}
+     * }
+     */
     ASN1_START_SEQUENCE
     {
-        ASN1_ENCODE_INTEGER(0);
+        ASN1_ENCODE_INTEGER(0);  // version INTEGER { v1(0) }
+
+        // subject Name
         ASN1_START_SEQUENCE
         {
             ASN1_START_SET
             {
                 ASN1_START_SEQUENCE
                 {
-                    ASN1_ENCODE_OBJECT_ID(kOID_AttributeType_OrganizationName);
+                    // Any subject, placeholder is good, since this
+                    // is going to usually be ignored
+                    ASN1_ENCODE_OBJECT_ID(kOID_AttributeType_OrganizationalUnitName);
                     ASN1_ENCODE_STRING(kASN1UniversalTag_UTF8String, "CSA", strlen("CSA"));
                 }
                 ASN1_END_SEQUENCE;
@@ -1319,6 +1335,7 @@ static CHIP_ERROR GenTBSCSR(ASN1Writer & writer, const Crypto::P256PublicKey & p
         }
         ASN1_END_SEQUENCE;
 
+        // subjectPKInfo
         ASN1_START_SEQUENCE
         {
             ASN1_START_SEQUENCE
@@ -1330,15 +1347,17 @@ static CHIP_ERROR GenTBSCSR(ASN1Writer & writer, const Crypto::P256PublicKey & p
             ReturnErrorOnFailure(writer.PutBitString(0, pubkey, static_cast<uint8_t>(pubkey.Length())));
         }
         ASN1_END_SEQUENCE;
+
+        // attributes [0]
         ASN1_START_CONSTRUCTED(kASN1TagClass_ContextSpecific, 0)
         {
+            // Using a plain empty attributes request
             ASN1_START_SEQUENCE {
                 ASN1_ENCODE_OBJECT_ID(kOID_Extension_CSRRequest);
                 ASN1_START_SET
                 {
                     ASN1_START_SEQUENCE {}
                     ASN1_END_SEQUENCE;
-
                 }
                 ASN1_END_SET;
             }
@@ -1347,93 +1366,80 @@ static CHIP_ERROR GenTBSCSR(ASN1Writer & writer, const Crypto::P256PublicKey & p
         ASN1_END_CONSTRUCTED;
     }
     ASN1_END_SEQUENCE;
-    exit:
-        return err;
+  exit:
+      return err;
 }
 
-static CHIP_ERROR EncodeCSR(ASN1Writer & writer, const Crypto::P256PublicKey & pubkey, chip::Crypto::P256ECDSASignature & signature)
+static CHIP_ERROR EncodeCSR(ASN1Writer & writer, const P256Keypair * keypair)
 {
+    VerifyOrReturnError(keypair != nullptr, CHIP_ERROR_INVALID_ARGUMENT);
+
+    // Generate the CertificatioRequestInformation inner encoding
+    // one time, to sign it, before re-generating it within the
+    // full ASN1 writer later, since it's easier than trying to
+    // figure-out the span we need to sign of the overall object.
+    chip::Crypto::P256ECDSASignature signature;
+
+    {
+        uint8_t toBeSignedBuffer[192];
+        ASN1Writer toBeSignedWriter;
+        toBeSignedWriter.Init(toBeSignedBuffer);
+        CHIP_ERROR err = GenerateCertificationRequestInformation(toBeSignedWriter, keypair->Pubkey());
+        ReturnErrorOnFailure(err);
+
+        size_t encodedLen = (uint16_t)toBeSignedWriter.GetLengthWritten();
+        err = keypair->ECDSA_sign_msg(toBeSignedBuffer, encodedLen, signature);
+        ReturnErrorOnFailure(err);
+    }
+
     CHIP_ERROR err = CHIP_NO_ERROR;
     ASN1_START_SEQUENCE
     {
-        ASN1_START_SEQUENCE
-        {
-            ASN1_ENCODE_INTEGER(0);
-            ASN1_START_SEQUENCE
-            {
-                ASN1_START_SET
-                {
-                    ASN1_START_SEQUENCE
-                    {
-                        ASN1_ENCODE_OBJECT_ID(kOID_AttributeType_OrganizationName);
-                        ASN1_ENCODE_STRING(kASN1UniversalTag_UTF8String, "CSA", strlen("CSA"));
-                    }
-                    ASN1_END_SEQUENCE;
-                }
-                ASN1_END_SET;
-            }
-            ASN1_END_SEQUENCE;
-
-            ASN1_START_SEQUENCE
-            {
-                ASN1_START_SEQUENCE
-                {
-                    ASN1_ENCODE_OBJECT_ID(kOID_PubKeyAlgo_ECPublicKey);
-                    ASN1_ENCODE_OBJECT_ID(kOID_EllipticCurve_prime256v1);
-                }
-                ASN1_END_SEQUENCE;
-                ReturnErrorOnFailure(writer.PutBitString(0, pubkey, static_cast<uint8_t>(pubkey.Length())));
-            }
-            ASN1_END_SEQUENCE;
-            ASN1_START_CONSTRUCTED(kASN1TagClass_ContextSpecific, 0)
-            {
-                ASN1_START_SEQUENCE {
-                    ASN1_ENCODE_OBJECT_ID(kOID_Extension_CSRRequest);
-                    ASN1_START_SET
-                    {
-                        ASN1_START_SEQUENCE {}
-                        ASN1_END_SEQUENCE;
-
-                    }
-                    ASN1_END_SET;
-                }
-                ASN1_END_SEQUENCE;
-            }
-            ASN1_END_CONSTRUCTED;
-        }
-        ASN1_END_SEQUENCE;
+        GenerateCertificationRequestInformation(writer, keypair->Pubkey());
 
         ASN1_START_SEQUENCE
         {
             ASN1_ENCODE_OBJECT_ID(kOID_SigAlgo_ECDSAWithSHA256);
+            // ASN1_ENCODE_NULL;  // Empty parameters
         }
         ASN1_END_SEQUENCE;
 
         ASN1_START_BIT_STRING_ENCAPSULATED
         {
+            // Convert raw signature to embedded signature
+            FixedByteSpan<Crypto::kP256_ECDSA_Signature_Length_Raw> rawSig(signature.Bytes());
+
+            uint8_t derInt[kP256_FE_Length + kEmitDerIntegerWithoutTagOverhead];
+
+            // Ecdsa-Sig-Value ::= SEQUENCE
             ASN1_START_SEQUENCE
             {
-                ASN1_ENCODE_INTEGER(0);
-                ASN1_ENCODE_INTEGER(2);
+                using P256IntegerSpan = FixedByteSpan<Crypto::kP256_FE_Length>;
+                // r INTEGER
+                {
+                    MutableByteSpan derIntSpan(derInt, sizeof(derInt));
+                    ReturnErrorOnFailure(ConvertIntegerRawToDerWithoutTag(P256IntegerSpan(rawSig.data()), derIntSpan));
+                    ReturnErrorOnFailure(writer.PutValue(kASN1TagClass_Universal, kASN1UniversalTag_Integer, false, derIntSpan.data(),
+                                                          static_cast<uint16_t>(derIntSpan.size())));
+                }
+
+                // s INTEGER
+                {
+                    MutableByteSpan derIntSpan(derInt, sizeof(derInt));
+                    ReturnErrorOnFailure(ConvertIntegerRawToDerWithoutTag(P256IntegerSpan(rawSig.data() + kP256_FE_Length), derIntSpan));
+                    ReturnErrorOnFailure(writer.PutValue(kASN1TagClass_Universal, kASN1UniversalTag_Integer, false, derIntSpan.data(),
+                                                          static_cast<uint16_t>(derIntSpan.size())));
+                }
             }
             ASN1_END_SEQUENCE;
+
         }
         ASN1_END_ENCAPSULATED;
-
-        // TODO: something is wrong here!
-        /*
-        uint8_t asn1SignatureBuf[kMax_ECDSA_Signature_Length_Der];
-        MutableByteSpan asn1Signature(asn1SignatureBuf);
-        ReturnErrorOnFailure(EcdsaRawSignatureToAsn1(kP256_FE_Length, ByteSpan(signature, signature.Length()), asn1Signature));
-
-        // signature OCTET STRING
-        ReturnErrorOnFailure(writer.PutOctetString(asn1Signature.data(), static_cast<uint16_t>(asn1Signature.size())));
-        */
     }
     ASN1_END_SEQUENCE;
 
-    exit:
-        return err;
+exit:
+    return err;
 }
 
 void TestCSR_Gen_Raw(nlTestSuite * inSuite, void * inContext)
@@ -1455,20 +1461,30 @@ void TestCSR_Gen_Raw(nlTestSuite * inSuite, void * inContext)
     //NL_TEST_ASSERT(inSuite, keypair.NewCertificateSigningRequest(csr, length) == CHIP_NO_ERROR);
 
     writer_tbs.Init(buf_tbs);
-    err = GenTBSCSR(writer_tbs, keypair.Pubkey());
+    err = GenerateCertificationRequestInformation(writer_tbs, keypair.Pubkey());
     NL_TEST_ASSERT(inSuite, err == CHIP_NO_ERROR);
+    encodedLen = (uint16_t)writer_tbs.GetLengthWritten();
+    printf("ENCODED LEN: %d\n", (int)encodedLen);
 
+    int fp;
+    unlink("/tmp/test_tbs.der");
+    fp = open("/tmp/test_tbs.der", O_CREAT | O_WRONLY, 777);
 
+    for (uint16_t i = 0; i < encodedLen; i++)
+    {
+        write(fp, &buf_tbs[i], 1);
+    }
+
+    close(fp);
 
     encodedLen = (uint16_t)writer_tbs.GetLengthWritten();
     keypair.ECDSA_sign_msg(buf_tbs, encodedLen, signature);
 
     writer_csr.Init(buf_csr);
-    err = EncodeCSR(writer_csr, keypair.Pubkey(), signature);
+    err = EncodeCSR(writer_csr, &keypair);
 
     encodedLen = (uint16_t)writer_csr.GetLengthWritten();
 
-    int fp;
     unlink("/tmp/test.der");
     fp = open("/tmp/test.der", O_CREAT | O_WRONLY, 777);
 
@@ -1478,11 +1494,11 @@ void TestCSR_Gen_Raw(nlTestSuite * inSuite, void * inContext)
     }
 
     close(fp);
-    
+
     NL_TEST_ASSERT(inSuite, length > 0);
 
     P256PublicKey pubkey;
-    err = VerifyCertificateSigningRequest(csr, length, pubkey);
+    err = VerifyCertificateSigningRequest(buf_csr, encodedLen, pubkey);
     if (err != CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE)
     {
         NL_TEST_ASSERT(inSuite, err == CHIP_NO_ERROR);
